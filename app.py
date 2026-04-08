@@ -28,10 +28,14 @@ SAM3_MODEL_NAME = "facebook/sam3-hiera-large" # 使用位置: app.py L43
 MAX_FRAMES = 60 # 使用位置: app.py L110
 # 设备选择
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu" # 使用位置: app.py L45
+# 项目根目录下的存储路径
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) # 使用位置: app.py L35
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads') # 使用位置: app.py L36
+OUTPUT_FOLDER = os.path.join(BASE_DIR, 'results') # 使用位置: app.py L37
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = '/tmp/sam3_uploads'
-app.config['OUTPUT_FOLDER'] = '/tmp/sam3_outputs'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
@@ -78,7 +82,7 @@ def extract_frames(video_path, max_frames=MAX_FRAMES):
     return frames, fps, (width, height)
 
 def generate_masks(image_np, prompt=None):
-    """根据提示词生成 masks"""
+    """根据提示词生成 masks 并进行可视化处理"""
     if sam_model is None or sam_processor is None:
         return []
     
@@ -89,29 +93,56 @@ def generate_masks(image_np, prompt=None):
         if prompt and prompt.strip():
             inputs = sam_processor(text=prompt, images=image_pil, return_tensors="pt").to(DEVICE)
         else:
-            # 否则进行自动分割 (使用空提示或默认逻辑)
+            # 否则进行自动分割
             inputs = sam_processor(images=image_pil, return_tensors="pt").to(DEVICE)
             
         with torch.no_grad():
             outputs = sam_model(**inputs)
             
-        # 后处理 masks
-        # 注意：不同模型的输出结构可能略有不同，这里假设标准输出
-        masks = outputs.pred_masks # [batch, num_masks, H, W]
+        # 提取 mask
+        if hasattr(outputs, 'pred_masks'):
+            masks = outputs.pred_masks
+        elif hasattr(outputs, 'masks'):
+            masks = outputs.masks
+        else:
+            # 备选：尝试从字典中获取
+            masks = outputs.get('pred_masks') or outputs.get('masks')
+
+        if masks is None:
+            return []
+
+        # 处理维度 [batch, num_masks, H, W] -> [num_masks, H, W]
         if masks.ndim == 4:
-            masks = masks[0] # 取第一张图
+            masks = masks[0]
             
-        # 将 tensor 转为 numpy bool array
-        masks_np = (torch.sigmoid(masks) > 0.5).cpu().numpy()
-        return masks_np[:5] # 限制数量
+        # 二值化并转为 numpy
+        # 某些模型输出是 logits，需要 sigmoid
+        masks_np = (torch.sigmoid(masks) > 0.0).cpu().numpy()
+        
+        # 过滤掉几乎为空的 mask
+        valid_masks = []
+        for m in masks_np:
+            if m.sum() > 10: # 至少有 10 个像素
+                valid_masks.append(m)
+                
+        return valid_masks[:5]
     except Exception as e:
         print(f"生成 mask 失败: {e}")
         return []
 
 def combine_frames_to_video(frames_bgr, output_path, fps, size):
-    """将帧合成视频"""
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, size)
+    """将帧合成视频，使用 H.264 编码以确保浏览器兼容性"""
+    # 优先尝试使用 avc1 (H.264)，如果失败则回退到 mp4v
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        out = cv2.VideoWriter(output_path, fourcc, fps, size)
+        if not out.isOpened():
+            raise Exception("avc1 编码器不可用")
+    except:
+        print("回退到 mp4v 编码器")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, size)
+        
     for frame in frames_bgr:
         out.write(frame)
     out.release()
@@ -137,10 +168,21 @@ def background_process_video(task_id, video_path, prompt):
             # 绘制结果
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             for m in masks:
-                color = np.random.randint(0, 255, 3).tolist()
+                # 获取随机颜色并确保是 list of ints
+                color = [int(c) for c in np.random.randint(0, 255, 3)]
+                # 确保 mask 是 2D (H, W)
                 mask_bool = m.astype(bool)
-                if mask_bool.ndim == 3: mask_bool = mask_bool[0]
-                frame_bgr[mask_bool] = frame_bgr[mask_bool] * 0.7 + np.array(color) * 0.3
+                if mask_bool.ndim == 3: 
+                    mask_bool = mask_bool[0]
+                
+                # 调整 mask 尺寸以匹配原图 (如果模型输出了缩小的 mask)
+                if mask_bool.shape != (size[1], size[0]):
+                    mask_bool = cv2.resize(mask_bool.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
+
+                # 应用半透明颜色叠加
+                mask_overlay = frame_bgr.copy()
+                mask_overlay[mask_bool] = color
+                cv2.addWeighted(mask_overlay, 0.4, frame_bgr, 0.6, 0, frame_bgr)
             
             processed_frames_bgr.append(frame_bgr)
 
