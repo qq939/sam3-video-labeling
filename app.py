@@ -248,9 +248,19 @@ def combine_frames_to_video(frames_bgr, output_path, fps, size):
         print("警告: 没有帧可合成视频")
         return
     
+    # 过滤掉无效帧
+    valid_frames = []
+    for f in frames_bgr:
+        if f is not None and f.ndim == 3 and f.shape[0] > 0 and f.shape[1] > 0 and f.shape[2] == 3:
+            valid_frames.append(f)
+    
+    if not valid_frames:
+        print("警告: 没有有效的帧可合成视频")
+        return
+    
     # 确保 size 有效
     if size[0] <= 0 or size[1] <= 0:
-        size = (frames_bgr[0].shape[1], frames_bgr[0].shape[0])
+        size = (valid_frames[0].shape[1], valid_frames[0].shape[0])
     
     # 确保 fps 有效
     if fps <= 0:
@@ -267,7 +277,7 @@ def combine_frames_to_video(frames_bgr, output_path, fps, size):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, size)
         
-    for frame in frames_bgr:
+    for frame in valid_frames:
         out.write(frame)
     out.release()
 
@@ -315,9 +325,21 @@ def background_process_video(task_id, video_path, prompt):
                 # 获取随机颜色并确保是 list of ints
                 color = [int(c) for c in np.random.randint(0, 255, 3)]
                 
-                # 调整 mask 尺寸以匹配原图 (如果模型输出了缩小的 mask)
-                if size[0] > 0 and size[1] > 0 and mask_bool.shape != (size[1], size[0]):
-                    mask_bool = cv2.resize(mask_bool.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
+                # 调整 mask 尺寸以匹配原图 (保护性检查)
+                resize_success = False
+                try:
+                    if (size[0] > 0 and size[1] > 0 and 
+                        mask_bool is not None and 
+                        mask_bool.ndim >= 2 and 
+                        mask_bool.shape[0] > 0 and mask_bool.shape[1] > 0 and
+                        mask_bool.shape != (size[1], size[0])):
+                        mask_bool = cv2.resize(mask_bool.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
+                        resize_success = True
+                except Exception as e:
+                    print(f"警告: mask 尺寸调整失败: {e}")
+                
+                if not resize_success:
+                    continue
 
                 # 应用半透明颜色叠加
                 mask_overlay = frame_bgr.copy()
@@ -329,6 +351,10 @@ def background_process_video(task_id, video_path, prompt):
 
         tasks[task_id]['current_action'] = '正在合成视频及保存元数据...'
         tasks[task_id]['progress'] = 90
+        
+        # 检查是否有有效帧
+        if not processed_frames_bgr:
+            raise Exception("没有有效的帧可处理")
         
         # 1. 保存标注后的视频
         output_video_filename = f'labeled_{task_id}.mp4'
