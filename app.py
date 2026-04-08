@@ -93,8 +93,13 @@ def generate_masks(image_np, prompt=None):
         if prompt and prompt.strip():
             inputs = sam_processor(text=prompt, images=image_pil, return_tensors="pt").to(DEVICE)
         else:
-            # 否则进行自动分割
-            inputs = sam_processor(images=image_pil, return_tensors="pt").to(DEVICE)
+            # 否则进行自动分割 (SAM3 自动模式通常需要提供 point 栅格，由处理器处理)
+            # 添加建议的推理参数
+            inputs = sam_processor(
+                images=image_pil, 
+                return_tensors="pt",
+                point_batch_size=64, # 提高自动分割的粒度
+            ).to(DEVICE)
             
         with torch.no_grad():
             outputs = sam_model(**inputs)
@@ -119,13 +124,18 @@ def generate_masks(image_np, prompt=None):
         if scores is not None and scores.ndim > 1:
             scores = scores[0]
 
-        # 二值化并转为 numpy
-        masks_np = (torch.sigmoid(masks) > 0.0).cpu().numpy()
+        # 二值化：关键修改，从 0.0 改为 0.5
+        masks_np = (torch.sigmoid(masks) > 0.5).cpu().numpy()
         
         valid_results = []
         for i, m in enumerate(masks_np):
+            # 3D mask 处理错误修复：确保 mask 是 2D (H, W)
+            # 如果 m 是 (C, H, W)，取所有通道的并集
+            if m.ndim == 3:
+                m = m.any(axis=0)
+                
             area = int(m.sum())
-            if area > 10: # 至少有 10 个像素
+            if area > 200: # 关键修改：从 10 改为 200，过滤无效噪点
                 # 计算 Bounding Box (XYXY)
                 pos = np.where(m)
                 if pos[0].size > 0:

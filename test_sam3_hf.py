@@ -23,20 +23,26 @@ class TestSAM3HF(unittest.TestCase):
 
     def test_app_generate_masks_mock(self):
         """测试 app.py 中的 generate_masks 函数"""
-        from app import generate_masks, sam_generator
+        from app import generate_masks
         import app
         
-        # Mock sam_generator
-        app.sam_generator = MagicMock()
+        # Mock sam_model 和 sam_processor
+        app.sam_model = MagicMock()
+        app.sam_processor = MagicMock()
+        
         mock_mask = np.zeros((100, 100), dtype=np.uint8)
-        app.sam_generator.return_value = [{"mask": mock_mask, "score": 0.9}]
+        # 模拟模型输出
+        mock_output = MagicMock()
+        mock_output.pred_masks = torch.from_numpy(np.zeros((1, 1, 100, 100))).float()
+        mock_output.get.return_value = None
+        app.sam_model.return_value = mock_output
         
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         masks = generate_masks(test_image)
         
-        self.assertEqual(len(masks), 1)
-        self.assertTrue(np.array_equal(masks[0]["mask"], mock_mask))
-        print("app.generate_masks Mock 测试通过")
+        # 由于我们设置了 area > 200，全零的 mask 应该被过滤掉
+        self.assertEqual(len(masks), 0)
+        print("app.generate_masks Mock 测试通过 (空面积过滤)")
 
 
 if __name__ == "__main__":

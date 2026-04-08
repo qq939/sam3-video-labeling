@@ -15,6 +15,9 @@ class TestSAM3Visualization(unittest.TestCase):
         mask_bool = np.zeros((size[1], size[0]), dtype=bool)
         mask_bool[100:200, 100:200] = True
         
+        # 验证面积是否超过新阈值 200
+        self.assertGreater(mask_bool.sum(), 200, "测试 Mask 面积应超过 200 像素")
+        
         # 模拟 app.py 中的叠加逻辑
         color = [0, 255, 0] # 绿色
         mask_overlay = frame_bgr.copy()
