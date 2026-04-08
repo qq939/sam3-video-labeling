@@ -104,7 +104,7 @@ def extract_frames(video_path, target_fps=16):
     cap.release()
     
     if not original_frames:
-        return [], fps, (width, height)
+        return [], fps if fps > 0 else 30, (width if width > 0 else 1280, height if height > 0 else 720)
     
     total_frames = len(original_frames)
     
@@ -244,6 +244,18 @@ def generate_masks(image_np, prompt=None):
 
 def combine_frames_to_video(frames_bgr, output_path, fps, size):
     """将帧合成视频，使用 H.264 编码以确保浏览器兼容性"""
+    if not frames_bgr:
+        print("警告: 没有帧可合成视频")
+        return
+    
+    # 确保 size 有效
+    if size[0] <= 0 or size[1] <= 0:
+        size = (frames_bgr[0].shape[1], frames_bgr[0].shape[0])
+    
+    # 确保 fps 有效
+    if fps <= 0:
+        fps = 30
+    
     # 优先尝试使用 avc1 (H.264)，如果失败则回退到 mp4v
     try:
         fourcc = cv2.VideoWriter_fourcc(*'avc1')
@@ -304,7 +316,7 @@ def background_process_video(task_id, video_path, prompt):
                 color = [int(c) for c in np.random.randint(0, 255, 3)]
                 
                 # 调整 mask 尺寸以匹配原图 (如果模型输出了缩小的 mask)
-                if mask_bool.shape != (size[1], size[0]):
+                if size[0] > 0 and size[1] > 0 and mask_bool.shape != (size[1], size[0]):
                     mask_bool = cv2.resize(mask_bool.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
 
                 # 应用半透明颜色叠加
