@@ -25,8 +25,6 @@ from translate import Translator
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'} # 使用位置: app.py L150
 # 模型名称
 SAM3_MODEL_NAME = "facebook/sam3" # 使用位置: app.py L43
-# 提取视频帧的最大数量
-MAX_FRAMES = 60 # 使用位置: app.py L110
 # 设备选择
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu" # 使用位置: app.py L45
 # 项目根目录下的存储路径
@@ -61,26 +59,21 @@ def init_sam3():
         print(f"SAM3 模型加载失败: {e}")
         return False
 
-def extract_frames(video_path, max_frames=MAX_FRAMES):
-    """从视频中提取帧并返回帧率和尺寸"""
+def extract_frames(video_path):
+    """从视频中提取所有帧并返回帧率和尺寸"""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     frames = []
-    interval = max(1, total_video_frames // max_frames)
-    
-    count = 0
-    while len(frames) < max_frames:
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
-        if count % interval == 0:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(rgb_frame)
-        count += 1
+        # BGR to RGB for PIL/Transformers
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(rgb_frame)
     
     cap.release()
     return frames, fps, (width, height)
