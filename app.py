@@ -82,7 +82,7 @@ def extract_frames(video_path, max_frames=MAX_FRAMES):
     return frames, fps, (width, height)
 
 def generate_masks(image_np, prompt=None):
-    """根据提示词生成 masks 并进行可视化处理"""
+    """根据提示词生成 masks 并提取元数据 (Bounding Box, Area, Score)"""
     if sam_model is None or sam_processor is None:
         return []
     
@@ -105,7 +105,6 @@ def generate_masks(image_np, prompt=None):
         elif hasattr(outputs, 'masks'):
             masks = outputs.masks
         else:
-            # 备选：尝试从字典中获取
             masks = outputs.get('pred_masks') or outputs.get('masks')
 
         if masks is None:
@@ -115,17 +114,33 @@ def generate_masks(image_np, prompt=None):
         if masks.ndim == 4:
             masks = masks[0]
             
+        # 提取分数 (如果存在)
+        scores = outputs.get('iou_scores') or outputs.get('scores')
+        if scores is not None and scores.ndim > 1:
+            scores = scores[0]
+
         # 二值化并转为 numpy
-        # 某些模型输出是 logits，需要 sigmoid
         masks_np = (torch.sigmoid(masks) > 0.0).cpu().numpy()
         
-        # 过滤掉几乎为空的 mask
-        valid_masks = []
-        for m in masks_np:
-            if m.sum() > 10: # 至少有 10 个像素
-                valid_masks.append(m)
+        valid_results = []
+        for i, m in enumerate(masks_np):
+            area = int(m.sum())
+            if area > 10: # 至少有 10 个像素
+                # 计算 Bounding Box (XYXY)
+                pos = np.where(m)
+                if pos[0].size > 0:
+                    bbox = [int(np.min(pos[1])), int(np.min(pos[0])), int(np.max(pos[1])), int(np.max(pos[0]))]
+                else:
+                    bbox = [0, 0, 0, 0]
                 
-        return valid_masks[:5]
+                valid_results.append({
+                    "mask": m,
+                    "bbox": bbox,
+                    "area": area,
+                    "score": float(scores[i]) if scores is not None else 1.0
+                })
+                
+        return valid_results[:5]
     except Exception as e:
         print(f"生成 mask 失败: {e}")
         return []
@@ -148,32 +163,48 @@ def combine_frames_to_video(frames_bgr, output_path, fps, size):
     out.release()
 
 def background_process_video(task_id, video_path, prompt):
-    """后台处理视频任务"""
+    """后台处理视频任务，并将结果和元数据保存在任务专用文件夹下"""
     try:
         tasks[task_id]['status'] = 'processing'
         tasks[task_id]['current_action'] = '正在读取视频帧...'
         
+        # 建立任务文件夹
+        video_filename = os.path.basename(video_path)
+        task_dir_name = f"{os.path.splitext(video_filename)[0]}_{task_id}"
+        task_dir = os.path.join(app.config['OUTPUT_FOLDER'], task_dir_name)
+        os.makedirs(task_dir, exist_ok=True)
+        
         frames_rgb, fps, size = extract_frames(video_path)
         tasks[task_id]['total_frames'] = len(frames_rgb)
         processed_frames_bgr = []
+        all_segmentation_data = [] # 存储每帧的分割元数据
         
         for idx, frame_rgb in enumerate(frames_rgb):
             tasks[task_id]['current_action'] = f'正在处理第 {idx+1}/{len(frames_rgb)} 帧...'
             tasks[task_id]['processed_frames'] = idx
-            tasks[task_id]['progress'] = (idx / len(frames_rgb)) * 80 # 前80%是处理帧
+            tasks[task_id]['progress'] = (idx / len(frames_rgb)) * 80
             tasks[task_id]['log'] = f'正在对帧 {idx} 进行 {prompt if prompt else "自动"} 分割...'
             
-            masks = generate_masks(frame_rgb, prompt)
+            mask_results = generate_masks(frame_rgb, prompt)
+            frame_data = {"frame_index": idx, "masks": []}
             
-            # 绘制结果
+            # 绘制结果并收集元数据
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            for m in masks:
+            for m_res in mask_results:
+                mask_bool = m_res["mask"]
+                bbox = m_res["bbox"]
+                area = m_res["area"]
+                score = m_res["score"]
+                
+                # 收集元数据
+                frame_data["masks"].append({
+                    "bbox": bbox,
+                    "area": area,
+                    "score": score
+                })
+                
                 # 获取随机颜色并确保是 list of ints
                 color = [int(c) for c in np.random.randint(0, 255, 3)]
-                # 确保 mask 是 2D (H, W)
-                mask_bool = m.astype(bool)
-                if mask_bool.ndim == 3: 
-                    mask_bool = mask_bool[0]
                 
                 # 调整 mask 尺寸以匹配原图 (如果模型输出了缩小的 mask)
                 if mask_bool.shape != (size[1], size[0]):
@@ -185,17 +216,30 @@ def background_process_video(task_id, video_path, prompt):
                 cv2.addWeighted(mask_overlay, 0.4, frame_bgr, 0.6, 0, frame_bgr)
             
             processed_frames_bgr.append(frame_bgr)
+            all_segmentation_data.append(frame_data)
 
-        tasks[task_id]['current_action'] = '正在合成视频文件...'
+        tasks[task_id]['current_action'] = '正在合成视频及保存元数据...'
         tasks[task_id]['progress'] = 90
         
-        output_filename = f'result_{task_id}.mp4'
-        output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-        combine_frames_to_video(processed_frames_bgr, output_path, fps, size)
+        # 1. 保存标注后的视频
+        output_video_filename = f'labeled_{task_id}.mp4'
+        output_video_path = os.path.join(task_dir, output_video_filename)
+        combine_frames_to_video(processed_frames_bgr, output_video_path, fps, size)
+        
+        # 2. 保存分割数据 (JSON)
+        data_filename = 'segmentation_data.json'
+        data_path = os.path.join(task_dir, data_filename)
+        with open(data_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "task_id": task_id,
+                "prompt": prompt,
+                "frames": all_segmentation_data
+            }, f, indent=4, ensure_ascii=False)
         
         tasks[task_id]['status'] = 'completed'
         tasks[task_id]['progress'] = 100
-        tasks[task_id]['video_url'] = f'/outputs/{output_filename}'
+        # 返回相对路径供前端预览 (Flask 静态路由)
+        tasks[task_id]['video_url'] = f'/outputs/{task_dir_name}/{output_video_filename}'
         tasks[task_id]['current_action'] = '处理完成'
         
     except Exception as e:
@@ -245,9 +289,9 @@ def get_status(task_id):
         return jsonify({"error": "任务不存在"}), 404
     return jsonify(tasks[task_id])
 
-@app.route('/outputs/<filename>')
-def serve_output(filename):
-    return send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+@app.route('/outputs/<path:path>')
+def serve_output(path):
+    return send_from_directory(app.config['OUTPUT_FOLDER'], path)
 
 if __name__ == '__main__':
     init_sam3()
