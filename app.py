@@ -152,13 +152,17 @@ def generate_masks(image_np, prompt=None):
             return []
         
         # 后处理: 处理图像原始尺寸
-        if "original_sizes" in inputs and "reshaped_input_sizes" in inputs:
+        if "original_sizes" in inputs and inputs["original_sizes"] is not None:
             orig_size = inputs["original_sizes"][0]
-            input_size = inputs["reshaped_input_sizes"][0]
             h, w = int(orig_size[0]), int(orig_size[1])
-            input_h, input_w = int(input_size[0]), int(input_size[1])
-            scale_x = w / input_w
-            scale_y = h / input_h
+            
+            if "reshaped_input_sizes" in inputs and inputs["reshaped_input_sizes"] is not None:
+                input_size = inputs["reshaped_input_sizes"][0]
+                input_h, input_w = int(input_size[0]), int(input_size[1])
+                scale_x = w / input_w
+                scale_y = h / input_h
+            else:
+                scale_x, scale_y = 1.0, 1.0
         else:
             h, w = image_pil.size[::-1]
             scale_x, scale_y = 1.0, 1.0
@@ -295,6 +299,12 @@ def background_process_video(task_id, video_path, prompt):
         
         frames_rgb, fps, size = extract_frames(video_path)
         tasks[task_id]['total_frames'] = len(frames_rgb)
+        
+        if not frames_rgb or size[0] <= 0 or size[1] <= 0:
+            raise Exception(f"视频帧提取失败或尺寸无效: frames={len(frames_rgb)}, size={size}")
+        
+        print(f"DEBUG: 视频尺寸 size={size}, fps={fps}, 帧数={len(frames_rgb)}")
+        
         processed_frames_bgr = []
         all_segmentation_data = [] # 存储每帧的分割元数据
         
