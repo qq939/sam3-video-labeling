@@ -11,3 +11,4 @@ ftfy
 regex
 iopath
 huggingface_hub
+translate

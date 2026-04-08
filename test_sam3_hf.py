@@ -21,6 +21,14 @@ class TestSAM3HF(unittest.TestCase):
         except ImportError as e:
             self.fail(f"无法从 transformers 导入 SAM3 组件: {e}")
 
+    def test_translation_logic(self):
+        """测试中文翻译逻辑"""
+        from translate import Translator
+        translator = Translator(from_lang="zh", to_lang="en")
+        result = translator.translate("螺丝枪")
+        self.assertIn(result.lower(), ["screwdriver", "screw gun", "power drill"])
+        print(f"翻译测试通过: 螺丝枪 -> {result}")
+
     def test_app_generate_masks_mock(self):
         """测试 app.py 中的 generate_masks 函数"""
         from app import generate_masks

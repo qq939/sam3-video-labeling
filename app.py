@@ -16,6 +16,7 @@ import threading
 import time
 from transformers import AutoProcessor, AutoModelForMaskGeneration
 from PIL import Image
+from translate import Translator
 
 # ==========================================
 # 全局参数配置 (Global Parameters)
@@ -23,7 +24,7 @@ from PIL import Image
 # 允许上传的视频扩展名
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'} # 使用位置: app.py L150
 # 模型名称
-SAM3_MODEL_NAME = "facebook/sam3-hiera-large" # 使用位置: app.py L43
+SAM3_MODEL_NAME = "facebook/sam3" # 使用位置: app.py L43
 # 提取视频帧的最大数量
 MAX_FRAMES = 60 # 使用位置: app.py L110
 # 设备选择
@@ -42,16 +43,19 @@ os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 # 全局变量
 sam_processor = None # 使用位置: app.py L42
 sam_model = None # 使用位置: app.py L44
+translator = None # 使用位置: app.py L90 (翻译器)
 tasks = {} # 使用位置: app.py L165 (任务状态存储)
 
 def init_sam3():
     """初始化 SAM3 模型与处理器"""
-    global sam_processor, sam_model
+    global sam_processor, sam_model, translator
     try:
         print(f"正在加载 SAM3 模型: {SAM3_MODEL_NAME} ...")
         sam_processor = AutoProcessor.from_pretrained(SAM3_MODEL_NAME)
         sam_model = AutoModelForMaskGeneration.from_pretrained(SAM3_MODEL_NAME).to(DEVICE)
-        print("SAM3 模型加载成功")
+        # 初始化翻译器 (中转英)
+        translator = Translator(from_lang="zh", to_lang="en")
+        print("SAM3 模型及翻译器加载成功")
         return True
     except Exception as e:
         print(f"SAM3 模型加载失败: {e}")
@@ -89,59 +93,70 @@ def generate_masks(image_np, prompt=None):
     image_pil = Image.fromarray(image_np)
     
     try:
-        # 如果有提示词，使用文本提示
+        # 如果有中文，翻译成英文 (SAM3 只支持英文文本提示)
+        if prompt and any('\u4e00' <= char <= '\u9fff' for char in prompt):
+            try:
+                prompt = translator.translate(prompt)
+                print(f"提示词已翻译为: {prompt}")
+            except Exception as e:
+                print(f"翻译失败: {e}")
+
+        # 文本+图像输入格式修正：text 参数通常是列表或字符串，具体取决于 processor
+        # 根据搜索，SAM3 使用 text=[prompt] 可能更稳定，或者直接传入字符串
         if prompt and prompt.strip():
-            inputs = sam_processor(text=prompt, images=image_pil, return_tensors="pt").to(DEVICE)
+            inputs = sam_processor(images=image_pil, text=[prompt], return_tensors="pt").to(DEVICE)
         else:
-            # 否则进行自动分割 (SAM3 自动模式通常需要提供 point 栅格，由处理器处理)
-            # 添加建议的推理参数
+            # 自动模式参数修正：需要提供 points_per_side 来生成点网格
             inputs = sam_processor(
                 images=image_pil, 
                 return_tensors="pt",
-                point_batch_size=64, # 提高自动分割的粒度
+                points_per_side=32, # 自动全图分割的点密度
             ).to(DEVICE)
             
         with torch.no_grad():
             outputs = sam_model(**inputs)
             
-        # 提取 mask
-        if hasattr(outputs, 'pred_masks'):
-            masks = outputs.pred_masks
-        elif hasattr(outputs, 'masks'):
-            masks = outputs.masks
-        else:
+        # 使用官方后处理函数，更准确且能处理尺寸缩放
+        try:
+            results_list = sam_processor.post_process_instance_segmentation(
+                outputs,
+                threshold=0.5,
+                mask_threshold=0.5,
+                target_sizes=inputs.get("original_sizes").tolist()
+            )
+            # 获取第一个 batch 的结果
+            res = results_list[0]
+            masks_np = res["masks"].cpu().numpy()
+            scores = res["scores"].cpu().numpy()
+            bboxes = res["boxes"].cpu().numpy()
+        except Exception as pe:
+            print(f"官方后处理失败，使用备选手动处理: {pe}")
+            # 备选手动处理逻辑 (包含之前的 0.5 阈值修正)
             masks = outputs.get('pred_masks') or outputs.get('masks')
+            if masks is None: return []
+            if masks.ndim == 4: masks = masks[0]
+            masks_np = (torch.sigmoid(masks) > 0.5).cpu().numpy()
+            scores = outputs.get('iou_scores') or outputs.get('scores')
+            if scores is not None and scores.ndim > 1: scores = scores[0].cpu().numpy()
+            bboxes = None
 
-        if masks is None:
-            return []
-
-        # 处理维度 [batch, num_masks, H, W] -> [num_masks, H, W]
-        if masks.ndim == 4:
-            masks = masks[0]
-            
-        # 提取分数 (如果存在)
-        scores = outputs.get('iou_scores') or outputs.get('scores')
-        if scores is not None and scores.ndim > 1:
-            scores = scores[0]
-
-        # 二值化：关键修改，从 0.0 改为 0.5
-        masks_np = (torch.sigmoid(masks) > 0.5).cpu().numpy()
-        
         valid_results = []
         for i, m in enumerate(masks_np):
-            # 3D mask 处理错误修复：确保 mask 是 2D (H, W)
-            # 如果 m 是 (C, H, W)，取所有通道的并集
+            # 确保 mask 是 2D (H, W)
             if m.ndim == 3:
                 m = m.any(axis=0)
                 
             area = int(m.sum())
-            if area > 200: # 关键修改：从 10 改为 200，过滤无效噪点
+            if area > 200: # 过滤噪点
                 # 计算 Bounding Box (XYXY)
-                pos = np.where(m)
-                if pos[0].size > 0:
-                    bbox = [int(np.min(pos[1])), int(np.min(pos[0])), int(np.max(pos[1])), int(np.max(pos[0]))]
+                if bboxes is not None:
+                    bbox = [int(x) for x in bboxes[i]]
                 else:
-                    bbox = [0, 0, 0, 0]
+                    pos = np.where(m)
+                    if pos[0].size > 0:
+                        bbox = [int(np.min(pos[1])), int(np.min(pos[0])), int(np.max(pos[1])), int(np.max(pos[0]))]
+                    else:
+                        bbox = [0, 0, 0, 0]
                 
                 valid_results.append({
                     "mask": m,
