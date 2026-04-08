@@ -1,0 +1,4 @@
+https://github.com/facebookresearch/sam3
+https://huggingface.co/docs/transformers/main/model_doc/sam3
+https://huggingface.co/facebook/sam3
+https://huggingface.co/docs/transformers/main/en/model_doc/sam3_tracker_video
