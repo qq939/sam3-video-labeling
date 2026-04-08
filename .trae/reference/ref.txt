@@ -1,4 +1,11 @@
-https://github.com/facebookresearch/sam3
-https://huggingface.co/docs/transformers/main/model_doc/sam3
-https://huggingface.co/facebook/sam3
-https://huggingface.co/docs/transformers/main/en/model_doc/sam3_tracker_video
+# SAM3 参考文档
+
+## Hugging Face SAM3 官方文档
+- SAM3 模型: https://huggingface.co/facebook/sam3
+- Transformers 文档: https://huggingface.co/docs/transformers/main/model_doc/sam3
+
+## SAM3 Pipeline 使用
+- Mask Generation Pipeline: https://huggingface.co/docs/transformers/main/en/pipeline_mixer#mask-generation
+
+## 相关模型
+- facebook/sam3: https://huggingface.co/facebook/sam3

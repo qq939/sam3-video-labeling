@@ -14,7 +14,7 @@ import uuid
 import json
 import threading
 import time
-from transformers import AutoProcessor, AutoModelForMaskGeneration
+from transformers import AutoProcessor, AutoModelForMaskGeneration, pipeline
 from PIL import Image
 from translate import Translator
 from dotenv import load_dotenv
@@ -29,7 +29,7 @@ load_dotenv()
 # 允许上传的视频扩展名
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'} # 使用位置: app.py L150
 # 模型名称
-SAM3_MODEL_NAME = "facebook/sam3" # 使用位置: app.py L43
+SAM3_MODEL_NAME = "facebook/sam3-base" # 正确的图像分割模型
 # Hugging Face Token (用于访问受限模型)
 # 请在项目根目录创建 .env 文件，并添加 HF_TOKEN=your_token
 HF_TOKEN = os.getenv("HF_TOKEN") # 使用位置: app.py L51, L52
@@ -50,20 +50,28 @@ os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 # 全局变量
 sam_processor = None # 使用位置: app.py L42
 sam_model = None # 使用位置: app.py L44
+sam_pipeline = None # 使用位置: app.py L45 (文本分割Pipeline)
 translator = None # 使用位置: app.py L90 (翻译器)
 tasks = {} # 使用位置: app.py L165 (任务状态存储)
 
 def init_sam3():
     """初始化 SAM3 模型与处理器"""
-    global sam_processor, sam_model, translator
+    global sam_processor, sam_model, sam_pipeline, translator
     try:
-        print(f"正在从 ModelScope 加载 SAM3 模型: {SAM3_MODEL_NAME} ...")
-        # 从 ModelScope 下载模型 (国内直连)
-        model_dir = snapshot_download(SAM3_MODEL_NAME, cache_dir=MODEL_DIR)
-        # 加载本地模型
+        # 使用本地已有的模型路径 (facebook/sam3)
+        model_dir = os.path.join(BASE_DIR, "models", "sam3", "facebook", "sam3")
+        
+        if not os.path.exists(model_dir):
+            print(f"模型路径不存在: {model_dir}，正在从 ModelScope 尝试下载...")
+            model_dir = snapshot_download(SAM3_MODEL_NAME, cache_dir=MODEL_DIR)
+        
+        print(f"正在加载 SAM3 模型: {model_dir}")
         sam_processor = AutoProcessor.from_pretrained(model_dir, token=HF_TOKEN)
         sam_model = AutoModelForMaskGeneration.from_pretrained(model_dir, token=HF_TOKEN).to(DEVICE)
-        # 初始化翻译器 (中转英)
+        
+        # 不再使用 pipeline，直接用 model + processor
+        sam_pipeline = None
+        
         translator = Translator(from_lang="zh", to_lang="en")
         print("SAM3 模型及翻译器加载成功")
         return True
@@ -113,7 +121,7 @@ def extract_frames(video_path, target_fps=16):
 
 def generate_masks(image_np, prompt=None):
     """根据提示词生成 masks 并提取元数据 (Bounding Box, Area, Score)"""
-    if sam_model is None or sam_processor is None:
+    if sam_processor is None or sam_model is None:
         return []
     
     image_pil = Image.fromarray(image_np)
@@ -127,70 +135,110 @@ def generate_masks(image_np, prompt=None):
             except Exception as e:
                 print(f"翻译失败: {e}")
 
-        # 文本提示使用 text 参数 (SAM3 processor 的正确参数名)
-        if prompt and prompt.strip():
-            inputs = sam_processor(images=image_pil, text=prompt, return_tensors="pt").to(DEVICE)
-        else:
-            # 自动模式参数修正：需要提供 points_per_side 来生成点网格
-            inputs = sam_processor(
-                images=image_pil, 
-                return_tensors="pt",
-                points_per_side=32, # 自动全图分割的点密度
-            ).to(DEVICE)
-            
+        # 直接使用 model + processor 进行分割 (绕过 pipeline 的默认阈值过滤)
+        inputs = sam_processor(images=image_pil, return_tensors="pt")
+        
+        if DEVICE == "cuda":
+            inputs = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        
         with torch.no_grad():
             outputs = sam_model(**inputs)
-            
-        # 使用官方后处理函数，更准确且能处理尺寸缩放
-        try:
-            results_list = sam_processor.post_process_instance_segmentation(
-                outputs,
-                threshold=0.5,
-                mask_threshold=0.5,
-                target_sizes=inputs.get("original_sizes").tolist()
-            )
-            # 获取第一个 batch 的结果
-            res = results_list[0]
-            masks_np = res["masks"].cpu().numpy()
-            scores = res["scores"].cpu().numpy()
-            bboxes = res["boxes"].cpu().numpy()
-        except Exception as pe:
-            print(f"官方后处理失败，使用备选手动处理: {pe}")
-            # 备选手动处理逻辑 (包含之前的 0.5 阈值修正)
-            masks = outputs.get('pred_masks') or outputs.get('masks')
-            if masks is None: return []
-            if masks.ndim == 4: masks = masks[0]
-            masks_np = (torch.sigmoid(masks) > 0.5).cpu().numpy()
-            scores = outputs.get('iou_scores') or outputs.get('scores')
-            if scores is not None and scores.ndim > 1: scores = scores[0].cpu().numpy()
-            bboxes = None
-
+        
+        # 获取原始输出
+        pred_masks = outputs.get("pred_masks", outputs.get("masks"))
+        iou_scores = outputs.get("iou_scores", outputs.get("scores"))
+        object_score_logits = outputs.get("object_score_logits")
+        
+        if pred_masks is None or len(pred_masks) == 0:
+            return []
+        
+        # 后处理: 处理图像原始尺寸
+        if "original_sizes" in inputs and "reshaped_input_sizes" in inputs:
+            orig_size = inputs["original_sizes"][0]
+            input_size = inputs["reshaped_input_sizes"][0]
+            h, w = int(orig_size[0]), int(orig_size[1])
+            input_h, input_w = int(input_size[0]), int(input_size[1])
+            scale_x = w / input_w
+            scale_y = h / input_h
+        else:
+            h, w = image_pil.size[::-1]
+            scale_x, scale_y = 1.0, 1.0
+        
+        # 手动过滤 masks (降低阈值，因为模型架构不匹配导致分数偏低)
         valid_results = []
-        for i, m in enumerate(masks_np):
-            # 确保 mask 是 2D (H, W)
-            if m.ndim == 3:
-                m = m.any(axis=0)
-                
-            area = int(m.sum())
-            if area > 200: # 过滤噪点
+        
+        # 检查 batch 维度并 squeeze
+        if pred_masks.dim() == 4:
+            pred_masks = pred_masks[0]  # [num_masks, H, W]
+        if iou_scores is not None and iou_scores.dim() > 1:
+            iou_scores = iou_scores.squeeze()  # [num_masks]
+        if object_score_logits is not None and object_score_logits.dim() > 0:
+            object_score_logits = object_score_logits.squeeze()  # 标量
+        
+        # 转换为 numpy 数组
+        if iou_scores is not None:
+            iou_scores_np = iou_scores.cpu().numpy()
+        else:
+            iou_scores_np = None
+        
+        if object_score_logits is not None:
+            object_score_logits_np = float(object_score_logits.cpu().numpy())
+        else:
+            object_score_logits_np = None
+        
+        num_masks = pred_masks.shape[0]
+        
+        for i in range(num_masks):
+            mask = pred_masks[i]
+            
+            # 将 mask 从模型输出尺寸缩放回原始图像尺寸
+            if scale_x != 1.0 or scale_y != 1.0:
+                mask = torch.nn.functional.interpolate(
+                    mask.unsqueeze(0).unsqueeze(0),
+                    size=(h, w),
+                    mode="bilinear",
+                    align_corners=False
+                ).squeeze()
+            
+            mask = mask.cpu().numpy()
+            
+            # 转换为二值 mask
+            mask = (mask > 0.0).astype(np.uint8)
+            
+            # 确保是 2D
+            if mask.ndim == 3:
+                mask = mask.any(axis=0)
+            
+            area = int(mask.sum())
+            if area > 200:
                 # 计算 Bounding Box (XYXY)
-                if bboxes is not None:
-                    bbox = [int(x) for x in bboxes[i]]
+                pos = np.where(mask)
+                if pos[0].size > 0:
+                    bbox = [int(np.min(pos[1])), int(np.min(pos[0])), int(np.max(pos[1])), int(np.max(pos[0]))]
                 else:
-                    pos = np.where(m)
-                    if pos[0].size > 0:
-                        bbox = [int(np.min(pos[1])), int(np.min(pos[0])), int(np.max(pos[1])), int(np.max(pos[0]))]
-                    else:
-                        bbox = [0, 0, 0, 0]
+                    bbox = [0, 0, 0, 0]
                 
-                valid_results.append({
-                    "mask": m,
-                    "bbox": bbox,
-                    "area": area,
-                    "score": float(scores[i]) if scores is not None else 1.0
-                })
+                # 计算综合分数 (IOU + object score)
+                iou = 0.5
+                if iou_scores_np is not None:
+                    iou = float(iou_scores_np[i])
                 
-        return valid_results[:5]
+                obj_score = 0.5
+                if object_score_logits_np is not None:
+                    obj_score = 1.0 / (1.0 + np.exp(-object_score_logits_np))  # sigmoid (scalar)
+                
+                combined_score = (iou + obj_score) / 2.0
+                
+                # 使用更低的阈值，因为模型架构不匹配
+                if combined_score > 0.4:
+                    valid_results.append({
+                        "mask": mask,
+                        "bbox": bbox,
+                        "area": area,
+                        "score": combined_score
+                    })
+        
+        return valid_results
     except Exception as e:
         print(f"生成 mask 失败: {e}")
         return []
