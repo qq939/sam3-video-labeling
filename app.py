@@ -13,8 +13,7 @@ from werkzeug.utils import secure_filename
 import uuid
 import json
 import threading
-import time
-from transformers import AutoProcessor, AutoModelForMaskGeneration, pipeline
+from transformers import AutoProcessor, AutoModelForMaskGeneration
 from PIL import Image
 from translate import Translator
 from dotenv import load_dotenv
