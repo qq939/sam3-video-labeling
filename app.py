@@ -17,6 +17,11 @@ import time
 from transformers import AutoProcessor, AutoModelForMaskGeneration
 from PIL import Image
 from translate import Translator
+from dotenv import load_dotenv
+from modelscope import snapshot_download
+
+# 加载 .env 文件中的环境变量
+load_dotenv()
 
 # ==========================================
 # 全局参数配置 (Global Parameters)
@@ -25,12 +30,16 @@ from translate import Translator
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'} # 使用位置: app.py L150
 # 模型名称
 SAM3_MODEL_NAME = "facebook/sam3" # 使用位置: app.py L43
+# Hugging Face Token (用于访问受限模型)
+# 请在项目根目录创建 .env 文件，并添加 HF_TOKEN=your_token
+HF_TOKEN = os.getenv("HF_TOKEN") # 使用位置: app.py L51, L52
 # 设备选择
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu" # 使用位置: app.py L45
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu" # 使用位置: app.py L54
 # 项目根目录下的存储路径
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) # 使用位置: app.py L35
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads') # 使用位置: app.py L36
 OUTPUT_FOLDER = os.path.join(BASE_DIR, 'results') # 使用位置: app.py L37
+MODEL_DIR = os.path.join(BASE_DIR, 'models', 'sam3') # 使用位置: app.py L43
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -48,9 +57,12 @@ def init_sam3():
     """初始化 SAM3 模型与处理器"""
     global sam_processor, sam_model, translator
     try:
-        print(f"正在加载 SAM3 模型: {SAM3_MODEL_NAME} ...")
-        sam_processor = AutoProcessor.from_pretrained(SAM3_MODEL_NAME)
-        sam_model = AutoModelForMaskGeneration.from_pretrained(SAM3_MODEL_NAME).to(DEVICE)
+        print(f"正在从 ModelScope 加载 SAM3 模型: {SAM3_MODEL_NAME} ...")
+        # 从 ModelScope 下载模型 (国内直连)
+        model_dir = snapshot_download(SAM3_MODEL_NAME, cache_dir=MODEL_DIR)
+        # 加载本地模型
+        sam_processor = AutoProcessor.from_pretrained(model_dir, token=HF_TOKEN)
+        sam_model = AutoModelForMaskGeneration.from_pretrained(model_dir, token=HF_TOKEN).to(DEVICE)
         # 初始化翻译器 (中转英)
         translator = Translator(from_lang="zh", to_lang="en")
         print("SAM3 模型及翻译器加载成功")
@@ -59,24 +71,45 @@ def init_sam3():
         print(f"SAM3 模型加载失败: {e}")
         return False
 
-def extract_frames(video_path):
-    """从视频中提取所有帧并返回帧率和尺寸"""
+def extract_frames(video_path, target_fps=16):
+    """从视频中提取帧并压缩到目标帧率
+    
+    Args:
+        video_path: 视频文件路径
+        target_fps: 目标帧率，默认为16
+    """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    frames = []
+    if fps <= 0:
+        fps = 30
+    
+    original_frames = []
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        # BGR to RGB for PIL/Transformers
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(rgb_frame)
+        original_frames.append(rgb_frame)
     
     cap.release()
-    return frames, fps, (width, height)
+    
+    if not original_frames:
+        return [], fps, (width, height)
+    
+    total_frames = len(original_frames)
+    
+    if total_frames <= target_fps:
+        return original_frames, fps, (width, height)
+    
+    frame_indices = np.linspace(0, total_frames - 1, target_fps, dtype=int)
+    sampled_frames = [original_frames[i] for i in frame_indices]
+    
+    new_fps = fps * (target_fps / total_frames)
+    
+    return sampled_frames, new_fps, (width, height)
 
 def generate_masks(image_np, prompt=None):
     """根据提示词生成 masks 并提取元数据 (Bounding Box, Area, Score)"""
@@ -94,10 +127,9 @@ def generate_masks(image_np, prompt=None):
             except Exception as e:
                 print(f"翻译失败: {e}")
 
-        # 文本+图像输入格式修正：text 参数通常是列表或字符串，具体取决于 processor
-        # 根据搜索，SAM3 使用 text=[prompt] 可能更稳定，或者直接传入字符串
+        # 文本提示使用 text 参数 (SAM3 processor 的正确参数名)
         if prompt and prompt.strip():
-            inputs = sam_processor(images=image_pil, text=[prompt], return_tensors="pt").to(DEVICE)
+            inputs = sam_processor(images=image_pil, text=prompt, return_tensors="pt").to(DEVICE)
         else:
             # 自动模式参数修正：需要提供 points_per_side 来生成点网格
             inputs = sam_processor(
@@ -313,4 +345,4 @@ def serve_output(path):
 
 if __name__ == '__main__':
     init_sam3()
-    app.run(host='0.0.0.0', port=8094)
+    app.run(host='0.0.0.0', port=8095)
