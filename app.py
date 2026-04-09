@@ -8,6 +8,7 @@ import os
 import cv2
 import torch
 import numpy as np
+import logging
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 import uuid
@@ -18,6 +19,17 @@ from PIL import Image
 from translate import Translator
 from dotenv import load_dotenv
 from modelscope import snapshot_download
+
+# 配置日志输出到文件
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    handlers=[
+        logging.FileHandler('/tmp/sam3_debug.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
@@ -137,6 +149,16 @@ def generate_masks(image_np, prompt=None):
         # 直接使用 model + processor 进行分割 (绕过 pipeline 的默认阈值过滤)
         inputs = sam_processor(images=image_pil, return_tensors="pt")
         
+        # 打印 inputs 的所有键和形状，用于调试
+        logger.debug(f"processor inputs keys: {list(inputs.keys())}")
+        for k, v in inputs.items():
+            if hasattr(v, 'shape'):
+                logger.debug(f"  {k}: {v.shape}")
+            elif isinstance(v, (list, tuple)):
+                logger.debug(f"  {k}: list/tuple len={len(v)}")
+                if len(v) > 0 and hasattr(v[0], 'shape'):
+                    logger.debug(f"    [0]: {v[0].shape}")
+        
         if DEVICE == "cuda":
             inputs = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         
@@ -152,17 +174,20 @@ def generate_masks(image_np, prompt=None):
             return []
         
         # 后处理: 处理图像原始尺寸
+        # pixel_values 是 1008x1008，模型输出 mask 是 288x288
+        # original_sizes 是 [width, height]
+        # 正确的 scale 是从 288x288 到原始图像尺寸
         if "original_sizes" in inputs and inputs["original_sizes"] is not None:
             orig_size = inputs["original_sizes"][0]
-            h, w = int(orig_size[0]), int(orig_size[1])
+            # orig_size 是 [width, height] 顺序
+            img_w, img_h = int(orig_size[0]), int(orig_size[1])
             
-            if "reshaped_input_sizes" in inputs and inputs["reshaped_input_sizes"] is not None:
-                input_size = inputs["reshaped_input_sizes"][0]
-                input_h, input_w = int(input_size[0]), int(input_size[1])
-                scale_x = w / input_w
-                scale_y = h / input_h
-            else:
-                scale_x, scale_y = 1.0, 1.0
+            # 模型输出 mask 的尺寸是 288x288
+            mask_h, mask_w = pred_masks.shape[-2], pred_masks.shape[-1]
+            scale_x = img_w / mask_w
+            scale_y = img_h / mask_h
+            h, w = img_h, img_w  # 转为 (height, width) 顺序用于 interpolate
+            logger.debug(f"scale: orig=({img_w},{img_h}), mask=({mask_h},{mask_w}), scale=({scale_x},{scale_y})")
         else:
             h, w = image_pil.size[::-1]
             scale_x, scale_y = 1.0, 1.0
@@ -170,8 +195,14 @@ def generate_masks(image_np, prompt=None):
         # 手动过滤 masks (降低阈值，因为模型架构不匹配导致分数偏低)
         valid_results = []
         
+        # pred_masks 可能是 [batch, 1, 3, H, W] (5D) 或 [batch, num_masks, H, W] (4D)
+        logger.debug(f"pred_masks shape before processing: {pred_masks.shape}")
+        
         # 检查 batch 维度并 squeeze
-        if pred_masks.dim() == 4:
+        if pred_masks.dim() == 5:
+            # [batch, 1, 3, H, W] -> [3, H, W]
+            pred_masks = pred_masks.squeeze(1).squeeze(0)  # [3, H, W]
+        elif pred_masks.dim() == 4:
             pred_masks = pred_masks[0]  # [num_masks, H, W]
         if iou_scores is not None and iou_scores.dim() > 1:
             iou_scores = iou_scores.squeeze()  # [num_masks]
@@ -190,36 +221,49 @@ def generate_masks(image_np, prompt=None):
             object_score_logits_np = None
         
         num_masks = pred_masks.shape[0]
+        logger.debug(f"num_masks: {num_masks}, pred_masks shape: {pred_masks.shape}")
         
         for i in range(num_masks):
             mask = pred_masks[i]
             
             # 将 mask 从模型输出尺寸缩放回原始图像尺寸
             if scale_x != 1.0 or scale_y != 1.0:
+                logger.debug(f"interpolate mask from 288x288 to {h}x{w}")
                 mask = torch.nn.functional.interpolate(
                     mask.unsqueeze(0).unsqueeze(0),
                     size=(h, w),
                     mode="bilinear",
                     align_corners=False
                 ).squeeze()
+                logger.debug(f"mask shape after interpolate: {mask.shape}")
             
             mask = mask.cpu().numpy()
             
             # 转换为二值 mask
             mask = (mask > 0.0).astype(np.uint8)
+            logger.debug(f"mask after binarize: min={mask.min()}, max={mask.max()}, unique={np.unique(mask)}")
             
             # 确保是 2D
             if mask.ndim == 3:
                 mask = mask.any(axis=0)
             
             area = int(mask.sum())
-            if area > 200:
-                # 计算 Bounding Box (XYXY)
-                pos = np.where(mask)
-                if pos[0].size > 0:
-                    bbox = [int(np.min(pos[1])), int(np.min(pos[0])), int(np.max(pos[1])), int(np.max(pos[0]))]
-                else:
-                    bbox = [0, 0, 0, 0]
+            logger.debug(f"mask area after interpolate: {area}")
+            
+            # 计算 Bounding Box (XYXY) - 使用更健壮的方法
+            pos = np.where(mask > 0)
+            if pos[0].size > 0:
+                y_indices = pos[0]
+                x_indices = pos[1]
+                y_min, y_max = int(np.min(y_indices)), int(np.max(y_indices))
+                x_min, x_max = int(np.min(x_indices)), int(np.max(x_indices))
+                
+                # 添加更详细的调试日志
+                logger.debug(f"pos[0] first 10: {y_indices[:10]}, unique first 20: {np.unique(y_indices)[:20]}")
+                logger.debug(f"pos[1] first 10: {x_indices[:10]}, unique first 20: {np.unique(x_indices)[:20]}")
+                
+                bbox = [x_min, y_min, x_max, y_max]
+                logger.debug(f"bbox calc: pos[0].size={pos[0].size}, area={area}, y_range=[{y_min},{y_max}], x_range=[{x_min},{x_max}]")
                 
                 # 计算综合分数 (IOU + object score)
                 iou = 0.5
@@ -240,6 +284,8 @@ def generate_masks(image_np, prompt=None):
                         "area": area,
                         "score": combined_score
                     })
+            else:
+                logger.debug("bbox calc: no mask pixels found, skipping mask")
         
         return valid_results
     except Exception as e:
@@ -324,20 +370,24 @@ def background_process_video(task_id, video_path, prompt):
                 bbox = m_res["bbox"]
                 area = m_res["area"]
                 score = m_res["score"]
+                logger.debug(f"adding mask to frame_data: bbox={bbox}, area={area}, score={score}")
                 
-                # 收集元数据
+                # 收集元数据 - 复制一份避免后续修改影响
                 frame_data["masks"].append({
-                    "bbox": bbox,
-                    "area": area,
-                    "score": score
+                    "bbox": list(bbox),
+                    "area": int(area),
+                    "score": float(score)
                 })
+                logger.debug(f"appended to frame_data: masks[-1]={frame_data['masks'][-1]}")
                 
                 # 获取随机颜色并确保是 list of ints
                 color = [int(c) for c in np.random.randint(0, 255, 3)]
                 
                 # 调整 mask 尺寸以匹配原图 (保护性检查)
                 resize_success = False
+                debug_info = ""
                 try:
+                    debug_info += f"size={size}, mask_shape={mask_bool.shape if mask_bool is not None else None}, "
                     if (size[0] > 0 and size[1] > 0 and 
                         mask_bool is not None and 
                         mask_bool.ndim >= 2 and 
@@ -345,8 +395,13 @@ def background_process_video(task_id, video_path, prompt):
                         mask_bool.shape != (size[1], size[0])):
                         mask_bool = cv2.resize(mask_bool.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
                         resize_success = True
+                    else:
+                        debug_info += f"跳过原因: size_ok={size[0]>0 and size[1]>0}, mask_ok={mask_bool is not None and mask_bool.ndim >= 2}"
+                        if mask_bool is not None and mask_bool.shape == (size[1], size[0]):
+                            resize_success = True
+                            debug_info += ", 尺寸相同无需调整"
                 except Exception as e:
-                    print(f"警告: mask 尺寸调整失败: {e}")
+                    print(f"警告: mask 尺寸调整失败: {e}, {debug_info}")
                 
                 if not resize_success:
                     continue
@@ -358,7 +413,7 @@ def background_process_video(task_id, video_path, prompt):
             
             processed_frames_bgr.append(frame_bgr)
             all_segmentation_data.append(frame_data)
-
+        
         tasks[task_id]['current_action'] = '正在合成视频及保存元数据...'
         tasks[task_id]['progress'] = 90
         
@@ -374,12 +429,14 @@ def background_process_video(task_id, video_path, prompt):
         # 2. 保存分割数据 (JSON)
         data_filename = 'segmentation_data.json'
         data_path = os.path.join(task_dir, data_filename)
+        logger.debug(f"about to dump JSON: {len(all_segmentation_data)} frames")
         with open(data_path, 'w', encoding='utf-8') as f:
             json.dump({
                 "task_id": task_id,
                 "prompt": prompt,
                 "frames": all_segmentation_data
             }, f, indent=4, ensure_ascii=False)
+        logger.debug(f"JSON saved to {data_path}")
         
         tasks[task_id]['status'] = 'completed'
         tasks[task_id]['progress'] = 100
